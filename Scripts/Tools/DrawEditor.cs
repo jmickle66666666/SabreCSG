@@ -3,6 +3,7 @@
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
+using Sabresaurus.SabreCSG.ShapeEditor.Decomposition;
 
 namespace Sabresaurus.SabreCSG
 {
@@ -286,6 +287,60 @@ namespace Sabresaurus.SabreCSG
             return new Vector2(maxX - minX, maxY - minY);
         }
 
+        private string GetDominantAxis(Plane plane) {
+            string dominantAxis;
+            // Calculate planar axes of dominant axis for grid calcs
+            if (Mathf.Abs(plane.normal.x) > Mathf.Abs(plane.normal.y)) {
+                if (Mathf.Abs(plane.normal.x) > Mathf.Abs(plane.normal.z)) {
+                    dominantAxis = "X";
+                } else {
+                    dominantAxis = "Z";
+                }
+            } else {
+                if (Mathf.Abs(plane.normal.y) > Mathf.Abs(plane.normal.z)) {
+                    dominantAxis = "Y";
+                } else {
+                    dominantAxis = "Z";
+                }
+            }
+            return dominantAxis;
+        }
+
+        private Vector3 GridPlanePoint(Vector3 point, Plane plane) {
+
+            string dominantAxis = GetDominantAxis(plane);
+
+            Ray hitRay = new Ray();
+            if (dominantAxis != "X") {
+                point.x = Mathf.Round(point.x / CurrentSettings.PositionSnapDistance) * CurrentSettings.PositionSnapDistance;
+            } else {
+                hitRay.direction = new Vector3(Mathf.Abs(point.x),0f,0f);
+                point.x = 0f;
+            }
+
+            if (dominantAxis != "Y") {
+                point.y = Mathf.Round(point.y / CurrentSettings.PositionSnapDistance) * CurrentSettings.PositionSnapDistance;
+            } else {
+                hitRay.direction = new Vector3(0f,Mathf.Abs(point.y),0f);
+                point.y = 0f;
+            }
+
+            if (dominantAxis != "Z") {
+                point.z = Mathf.Round(point.z / CurrentSettings.PositionSnapDistance) * CurrentSettings.PositionSnapDistance;
+            } else {
+                hitRay.direction = new Vector3(0f,0f,Mathf.Abs(point.z));
+                point.z = 0f;
+            }
+
+            hitRay.origin = point;
+
+            float dist;
+            plane.Raycast(hitRay, out dist);
+            point = hitRay.GetPoint(dist);
+
+            return point;
+        }
+
         private Vector3? GetHitPoint(Vector2 currentPosition)
         {
             // Conver the mouse position into a ray to intersect with a plane in the world
@@ -306,16 +361,7 @@ namespace Sabresaurus.SabreCSG
 
                     if (activePolygon != null)
                     {
-                        // Rotation to go from the polygon's plane to XY plane (for sorting)
-                        Quaternion cancellingRotation = Quaternion.Inverse(Quaternion.LookRotation(plane.normal));
-                        Quaternion restoringRotation = Quaternion.LookRotation(plane.normal);
-                        hitPoint -= activePolygon.GetCenterPoint();
-                        Vector3 localHitPoint = cancellingRotation * hitPoint;
-                        // Round in local space
-                        localHitPoint = MathHelper.RoundVector3(localHitPoint, CurrentSettings.PositionSnapDistance);
-                        // Convert back to correct space
-                        hitPoint = restoringRotation * localHitPoint;
-                        hitPoint += activePolygon.GetCenterPoint();
+                        hitPoint = GridPlanePoint(hitPoint, plane);
                     }
                     else
                     {
@@ -660,6 +706,7 @@ namespace Sabresaurus.SabreCSG
 
         private void CreateBrush(List<Vector3> positions)
         {
+            Plane plane = GetActivePlane();
             Polygon sourcePolygon = PolygonFactory.ConstructPolygon(positions, true);
 
             // Early out if it wasn't possible to create the polygon
@@ -677,7 +724,7 @@ namespace Sabresaurus.SabreCSG
                 }
             }
 
-            Vector3 planeNormal = GetActivePlane().normal;
+            Vector3 planeNormal = plane.normal;
 
             //			Debug.Log(Vector3.Dot(sourcePolygon.Plane.normal, planeNormal));
 
@@ -693,6 +740,52 @@ namespace Sabresaurus.SabreCSG
                     uv.x = 1 - uv.x;
                     sourcePolygon.Vertices[i].UV = uv;
                 }
+            }
+
+            Matrix4x4 matrix = sourcePolygon.MapTo2D();
+
+            List<Vector2> vertices2D = new List<Vector2>();
+            float y = sourcePolygon.Vertices[0].Position.y;
+
+            System.Array.ForEach(sourcePolygon.Vertices, v => {
+                vertices2D.Add(new Vector2(v.Position.x, v.Position.z));
+            });
+            vertices2D.Reverse();
+            List<Vector2[]> convex2DPolygons = BayazitDecomposer.ConvexPartition(vertices2D.ToArray());
+
+            List<Polygon> convexPolygons = new List<Polygon>();
+            if (convex2DPolygons.Count == 1) {
+                List<Vector2> points = new List<Vector2>(convex2DPolygons[0]);
+                points.Reverse();
+                for (int i = 0; i < points.Count; i++) {
+                    sourcePolygon.Vertices[i].Position.Set(
+                        convex2DPolygons[0][i].x,
+                        y,
+                        convex2DPolygons[0][i].y
+                    );
+                }
+
+                sourcePolygon.MapTo3D(matrix);
+
+                sourcePolygon.CalculatePlane();
+                sourcePolygon.ResetVertexNormals();
+                sourcePolygon.GenerateUvCoordinates();
+
+            } else {
+                for (int i = 0; i < convex2DPolygons.Count; i++) {
+
+                    List<Vector2> points = new List<Vector2>(convex2DPolygons[i]);
+
+                    List<Vector3> vertices = new List<Vector3>();
+                    points.ForEach(p => {
+                        vertices.Add(matrix.inverse * new Vector3(p.x, y, p.y));
+                    });
+
+                    // vertices.Reverse();
+
+                    CreateBrush(vertices);
+                }
+                return;
             }
 
             float extrusionDistance = 1;
@@ -746,6 +839,8 @@ namespace Sabresaurus.SabreCSG
 
             Quaternion rotation;
             Polygon[] polygons;
+            sourcePolygon.Flip();
+
             SurfaceUtility.ExtrudePolygon(sourcePolygon, extrusionDistance, out polygons, out rotation);
 
             GameObject newObject = csgModel.CreateCustomBrush(polygons);
@@ -826,17 +921,14 @@ namespace Sabresaurus.SabreCSG
             Plane plane = GetActivePlane();
             Vector3 planeNormal = plane.normal; //MathHelper.VectorAbs(plane.normal);
 
-            Vector3 axis1;
             Vector3 axis2;
 
             if (Vector3.Dot(planeNormal.Abs(), Vector3.up) > 0.99f)
             {
-                axis1 = Vector3.forward;
                 axis2 = Vector3.right;
             }
             else
             {
-                axis1 = Vector3.up;
                 axis2 = Vector3.Cross(Vector3.up, planeNormal).normalized;
             }
 
@@ -847,13 +939,12 @@ namespace Sabresaurus.SabreCSG
 
             Vector3 delta = endPoint - startPoint;
 
-            Vector3 deltaAxis1 = Vector3.Dot(delta, axis1) * axis1;
             Vector3 deltaAxis2 = Vector3.Dot(delta, axis2) * axis2;
 
             points.Add(startPoint);
-            points.Add(startPoint + deltaAxis1);
-            points.Add(endPoint);
             points.Add(startPoint + deltaAxis2);
+            points.Add(endPoint);
+            points.Add(endPoint - deltaAxis2);
 
             return points;
         }
